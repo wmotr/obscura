@@ -1,3 +1,19 @@
+## OpenTelemetry
+
+Obscura exports navigation and interaction spans over OTLP/HTTP when an endpoint is configured. No endpoint means no exporter and no telemetry overhead beyond existing `tracing` spans.
+
+### `OTEL_EXPORTER_OTLP_ENDPOINT`
+
+Base OTLP/HTTP collector endpoint. Obscura emits `browser.navigate` spans for page loads and `browser.interaction` spans for MCP and CDP commands. Navigation spans include the requested URL, final URL, scheme, server address, HTTP method, page id, wait condition, duration, and error status. Interaction spans include operation name, protocol, page or session context, duration, and error status. URLs can contain sensitive query parameters, so configure collector access and retention accordingly.
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_SERVICE_NAME=obscura \
+obscura fetch https://example.com --dump text
+```
+
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` may instead point directly to the traces endpoint, such as `http://127.0.0.1:4318/v1/traces`. Set `OTEL_SERVICE_NAME` to override the default `obscura` service name.
+
 ## Runtime
 
 ### `OBSCURA_ALLOW_PRIVATE_NETWORK`

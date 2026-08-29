@@ -5,6 +5,8 @@ use obscura_browser::{BrowserContext, Page};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+mod telemetry;
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd")]
 enum WorkerCommand {
@@ -42,10 +44,7 @@ impl WorkerResponse {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .with_writer(std::io::stderr)
-        .init();
+    let _telemetry = telemetry::init("warn").expect("failed to initialize telemetry");
 
     let proxy = std::env::var("OBSCURA_PROXY")
         .ok()

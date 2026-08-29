@@ -286,7 +286,7 @@ obscura serve --port 9222 --allow-private-network
 ```
 
 See [docs/Environment-variables.md](docs/Environment-variables.md) for the
-full allow/deny rules (DNS-resolution-time checks included).
+full runtime reference, including SSRF rules and opt-in OpenTelemetry export for navigation and interaction traces.
 ```
 
 ## Rendering

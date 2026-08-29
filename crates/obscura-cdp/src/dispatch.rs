@@ -422,6 +422,16 @@ fn is_v8_free_method(method: &str) -> bool {
     )
 }
 
+#[tracing::instrument(
+    name = "browser.interaction",
+    skip_all,
+    fields(
+        browser.interaction.name = %req.method,
+        browser.interaction.protocol = "cdp",
+        browser.session.id = ?req.session_id,
+        error.type = tracing::field::Empty,
+    ),
+)]
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
@@ -553,6 +563,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     match result {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
         Err(msg) => {
+            tracing::Span::current().record("error.type", "browser.interaction.error");
             tracing::warn!("CDP error for {}: {}", req.method, msg);
             CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
         }
