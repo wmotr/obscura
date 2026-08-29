@@ -52,7 +52,7 @@ jobs:
           cp LICENSE README.md "dist/$package/"
           printf '%s\n' "$SHA" >"dist/$package/GIT_COMMIT"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
-          sha256sum "dist/$package.tar.gz" >"dist/$package.tar.gz.sha256"
+          (cd dist && sha256sum "$package.tar.gz" >"$package.tar.gz.sha256")
           echo "name=$package" >>"$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
