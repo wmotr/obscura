@@ -2550,6 +2550,21 @@ impl Page {
             .await
     }
 
+    #[tracing::instrument(
+        name = "browser.navigate",
+        skip_all,
+        fields(
+            url.full = %url_str,
+            url.scheme = tracing::field::Empty,
+            server.address = tracing::field::Empty,
+            http.request.method = %method,
+            browser.page.id = %self.id,
+            browser.wait_until = ?wait_until,
+            browser.final_url = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        ),
+        err,
+    )]
     pub async fn navigate_with_wait_post(
         &mut self,
         url_str: &str,
@@ -2557,6 +2572,13 @@ impl Page {
         method: &str,
         body: &str,
     ) -> Result<(), PageError> {
+        let span = tracing::Span::current();
+        if let Ok(url) = Url::parse(url_str) {
+            span.record("url.scheme", url.scheme());
+            if let Some(host) = url.host_str() {
+                span.record("server.address", host);
+            }
+        }
         // Hard ceiling on a single end-to-end navigation. Without this a slow
         // primary fetch or a runaway settle loop can hold the V8 lock for
         // arbitrarily long (we've measured 60+ seconds on JS-heavy news
@@ -2584,7 +2606,11 @@ impl Page {
             }
         };
         if result.is_ok() {
-            self.push_history(self.url_string());
+            let final_url = self.url_string();
+            tracing::Span::current().record("browser.final_url", final_url.as_str());
+            self.push_history(final_url);
+        } else if let Err(error) = &result {
+            tracing::Span::current().record("error.type", std::any::type_name_of_val(error));
         }
         result
     }

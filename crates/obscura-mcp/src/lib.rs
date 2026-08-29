@@ -691,12 +691,27 @@ fn handle_tools_list(id: Value) -> RpcResponse {
     RpcResponse::ok(id, json!({ "tools": tools }))
 }
 
+#[tracing::instrument(
+    name = "browser.interaction",
+    skip_all,
+    fields(
+        browser.interaction.name = tracing::field::Empty,
+        browser.page.url = tracing::field::Empty,
+        browser.page.title = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    ),
+)]
 async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
     let name = match params.get("name").and_then(Value::as_str) {
         Some(n) => n,
         None => return RpcResponse::err(id, -32602, "Missing tool name"),
     };
     let args = params.get("arguments").unwrap_or(&Value::Null);
+    let span = tracing::Span::current();
+    span.record("browser.interaction.name", name);
+    let page = state.page_mut();
+    span.record("browser.page.url", page.url_string().as_str());
+    span.record("browser.page.title", page.title.as_str());
 
     #[cfg(feature = "render")]
     {
@@ -761,10 +776,13 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         Ok(content) => RpcResponse::ok(id, json!({
             "content": [{ "type": "text", "text": content }]
         })),
-        Err(e) => RpcResponse::ok(id, json!({
-            "content": [{ "type": "text", "text": format!("Error: {e}") }],
-            "isError": true
-        })),
+        Err(e) => {
+            tracing::Span::current().record("error.type", "browser.interaction.error");
+            RpcResponse::ok(id, json!({
+                "content": [{ "type": "text", "text": format!("Error: {e}") }],
+                "isError": true
+            }))
+        }
     }
 }
 
