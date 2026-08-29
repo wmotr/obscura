@@ -42,7 +42,7 @@ impl WorkerResponse {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let _telemetry = telemetry::init("warn").expect("failed to initialize telemetry");
 
