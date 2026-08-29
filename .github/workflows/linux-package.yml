@@ -1,0 +1,66 @@
+name: Linux package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build Linux x86_64 package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release binaries
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --release -p obscura-cli --bins --features render
+
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          target/release/obscura --version
+          target/release/obscura --help >/dev/null
+          target/release/obscura-worker </dev/null
+
+      - name: Package binaries
+        id: package
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          package="obscura-x86_64-linux-otel-${SHA:0:12}"
+          mkdir -p "dist/$package"
+          install -m 0755 target/release/obscura "dist/$package/obscura"
+          install -m 0755 target/release/obscura-worker "dist/$package/obscura-worker"
+          cp LICENSE README.md "dist/$package/"
+          printf '%s\n' "$SHA" >"dist/$package/GIT_COMMIT"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          sha256sum "dist/$package.tar.gz" >"dist/$package.tar.gz.sha256"
+          echo "name=$package" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

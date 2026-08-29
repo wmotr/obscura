@@ -287,6 +287,8 @@ obscura serve --port 9222 --allow-private-network
 
 See [docs/Environment-variables.md](docs/Environment-variables.md) for the
 full runtime reference, including SSRF rules and opt-in OpenTelemetry export for navigation and interaction traces.
+
+The wmotr fork builds a downloadable Linux x86_64 package after every update to `main`. Download the `obscura-x86_64-linux-otel-<commit>` artifact from the latest [Linux package workflow](https://github.com/wmotr/obscura/actions/workflows/linux-package.yml). Each artifact contains `obscura`, `obscura-worker`, its source commit, and a SHA-256 checksum.
 ```
 
 ## Rendering
