@@ -3,6 +3,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::TracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
 use tracing_subscriber::util::SubscriberInitExt;
 
 pub(crate) struct TelemetryGuard {
@@ -18,14 +19,13 @@ impl Drop for TelemetryGuard {
 }
 
 pub(crate) fn init(filter: &str) -> anyhow::Result<TelemetryGuard> {
-    let fmt = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    let configured_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
 
     if !telemetry_enabled() {
         tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt)
+            .with(configured_filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .init();
         return Ok(TelemetryGuard { provider: None });
     }
@@ -44,10 +44,15 @@ pub(crate) fn init(filter: &str) -> anyhow::Result<TelemetryGuard> {
         .build();
     let tracer = provider.tracer("obscura");
     global::set_tracer_provider(provider.clone());
+    // Quiet mode suppresses stderr, not exported activity spans.
+    let telemetry_filter = tracing_subscriber::EnvFilter::new("off,obscura_browser=info,obscura_cdp=info,obscura_mcp=info");
     tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt)
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(configured_filter),
+        )
+        .with(tracing_opentelemetry::layer().with_tracer(tracer).with_filter(telemetry_filter))
         .init();
     Ok(TelemetryGuard {
         provider: Some(provider),
