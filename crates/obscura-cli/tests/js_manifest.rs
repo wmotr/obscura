@@ -146,7 +146,7 @@ fn check_manifest(endpoint: Option<&str>) {
     let url = fixture();
     let mut command = Command::new(env!("CARGO_BIN_EXE_obscura"));
     command
-        .args(["--allow-private-network", "fetch", &url, "--wait", "0", "--eval", "(async () => { for (let i = 0; i < 400 && document.title === 'pending'; i++) await new Promise(resolve => setTimeout(resolve, 25)); return document.title; })()", "--quiet"])
+        .args(["--allow-private-network", "fetch", &url, "--wait", "5", "--eval", "document.title", "--quiet"])
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .env("OTEL_SERVICE_NAME", "obscura-test")
