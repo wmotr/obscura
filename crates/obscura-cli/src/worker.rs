@@ -42,7 +42,8 @@ impl WorkerResponse {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+// deno_unsync op futures must stay on the isolate's thread.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let _telemetry = telemetry::init("warn").expect("failed to initialize telemetry");
 

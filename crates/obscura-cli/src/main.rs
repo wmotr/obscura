@@ -303,7 +303,8 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+// deno_unsync op futures must stay on the isolate's thread.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
