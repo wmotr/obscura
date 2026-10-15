@@ -36,7 +36,9 @@ pub(crate) fn init(filter: &str) -> anyhow::Result<TelemetryGuard> {
         .with_endpoint(endpoint)
         .build()?;
     let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        // Export on the SDK's dedicated thread so shutdown can block without
+        // moving Deno's non-Send op futures onto Tokio worker threads.
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::TokioCurrentThread)
         .with_resource(opentelemetry_sdk::Resource::new([opentelemetry::KeyValue::new(
             "service.name",
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "obscura".to_string()),
