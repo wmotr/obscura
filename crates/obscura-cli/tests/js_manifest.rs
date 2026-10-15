@@ -23,11 +23,25 @@ fn fixture() -> String {
             let mut request = [0; 4096];
             let count = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..count]);
+            let empty_status = if request.starts_with("GET /empty") { Some(204) }
+                else if request.starts_with("GET /not-modified") { Some(304) }
+                else if request.starts_with("HEAD /manifest") { Some(200) }
+                else { None };
+            if let Some(status) = empty_status {
+                let _ = write!(stream, "HTTP/1.1 {status} No Body\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
+            }
             let (kind, body) = if request.starts_with("GET /manifest") {
                 ("application/json", r#"{"matcher":{"static":{},"wildcard":{},"dynamic":{}}}"#)
             } else {
                 ("text/html", r#"<!doctype html><title>pending</title><script>
                 (async () => {
+                    for (const [path, init] of [['/empty', {}], ['/not-modified', {}], ['/manifest', {method: 'HEAD'}]]) {
+                        const response = await fetch(path, init);
+                        if (response.body !== null || response.bodyUsed || await response.text() !== '' || response.bodyUsed) {
+                            throw new Error('unexpected body for ' + path);
+                        }
+                    }
                     // Match ofetch's body guard used by Nuxt manifest loading.
                     async function manifest() {
                         const response = await fetch('/manifest');
@@ -132,7 +146,7 @@ fn check_manifest(endpoint: Option<&str>) {
     let url = fixture();
     let mut command = Command::new(env!("CARGO_BIN_EXE_obscura"));
     command
-        .args(["--allow-private-network", "fetch", &url, "--wait", "3", "--eval", "document.title", "--quiet"])
+        .args(["--allow-private-network", "fetch", &url, "--wait", "0", "--eval", "(async () => { for (let i = 0; i < 400 && document.title === 'pending'; i++) await new Promise(resolve => setTimeout(resolve, 25)); return document.title; })()", "--quiet"])
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .env("OTEL_SERVICE_NAME", "obscura-test")

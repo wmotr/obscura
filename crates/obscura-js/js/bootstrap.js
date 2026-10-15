@@ -6938,7 +6938,8 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
   const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
-  const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
+  const nullBody = method.toUpperCase() === 'HEAD' || [101, 103, 204, 205, 304].includes(parsed.status) || respType === 'opaque';
+  const responseBody = nullBody ? null : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
   const response = new Response(responseBody, {
     status: parsed.status,
     statusText: "",
