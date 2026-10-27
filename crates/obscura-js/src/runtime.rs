@@ -13537,6 +13537,38 @@ mod tests {
         assert_eq!(out["nullUsed"], false);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_pipe_and_tee_mark_consumption() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+                const piped = new Response('pipe');
+                let text = '';
+                await piped.body.pipeTo(new WritableStream({
+                    write(chunk) { text += new TextDecoder().decode(chunk); }
+                }));
+                const teed = new Response('tee');
+                const branches = teed.body.tee();
+                await branches[0].getReader().read();
+                await branches[1].getReader().read();
+                const rejected = [];
+                for (const response of [piped, teed]) {
+                    let cloneRejected = false;
+                    try { response.clone(); } catch (e) { cloneRejected = e instanceof TypeError; }
+                    let textRejected = false;
+                    try { await response.text(); } catch (e) { textRejected = e instanceof TypeError; }
+                    rejected.push(response.bodyUsed && cloneRejected && textRejected);
+                }
+                return { text, rejected };
+            })()"#,
+            true,
+            true,
+        ).await.expect("stream consumption must succeed");
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "text": "pipe", "rejected": [true, true]
+        }));
+    }
+
     #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");

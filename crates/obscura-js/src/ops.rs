@@ -2473,6 +2473,8 @@ async fn op_fetch_url(
     let mut current_method = req_method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    // Once a no-cors redirect crosses origins, returning home cannot untaint it.
+    let mut opaque = false;
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -2481,6 +2483,7 @@ async fn op_fetch_url(
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
+        opaque |= mode == "no-cors" && current_is_cross_origin;
         if current_is_cross_origin {
             req = req.header("Origin", &page_origin);
         }
@@ -2724,7 +2727,9 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
+        "opaque": opaque,
+        "redirected": redirects_followed > 0,
         "headers": resp_headers,
     })
     .to_string())
@@ -2771,6 +2776,8 @@ async fn stealth_fetch_all(
     let mut current_method = method;
     let mut current_body = body;
     let mut redirects_followed: usize = 0;
+    // Match the rustls path's response tainting across every redirect hop.
+    let mut opaque = false;
 
     let (status, resp_headers, resp_bytes): (u16, HashMap<String, String>, Vec<u8>) = loop {
         let parsed_current = match url::Url::parse(&current_url) {
@@ -2785,6 +2792,7 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
+        opaque |= mode == "no-cors" && current_is_cross_origin;
         if current_is_cross_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
@@ -2893,7 +2901,9 @@ async fn stealth_fetch_all(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        "url": current_url,
+        "opaque": opaque,
+        "redirected": redirects_followed > 0,
         "headers": resp_headers,
     })
     .to_string())
