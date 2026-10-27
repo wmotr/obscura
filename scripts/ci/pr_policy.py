@@ -33,6 +33,11 @@ UNTRUSTED_CONTEXT_RE = re.compile(
     r"issue\.(?:title|body)|comment\.body|head_commit\.message)"
 )
 BLOCKED_SUFFIXES = {".dll", ".dylib", ".exe", ".o", ".obj", ".pyc", ".so"}
+# Trusted-base approval covers only this reviewed security patch, not an
+# arbitrary new crate or later changes to the incoming dependency tree.
+APPROVED_NEW_VENDOR_TREES = {
+    "vendor/wreq-util": "24d4d93e01c9227d83a5009e32bdba42aab276f2",
+}
 
 
 def git(*args: str, text: bool = False) -> bytes | str:
@@ -81,7 +86,7 @@ def check_control_symlinks(files: list[str], errors: list[str]) -> None:
             return
 
 
-def check_new_vendor(base: str, files: list[str], errors: list[str]) -> None:
+def check_new_vendor(base: str, head: str, files: list[str], errors: list[str]) -> None:
     roots = sorted(
         {"/".join(PurePosixPath(name).parts[:2]) for name in files if name.startswith("vendor/")}
     )
@@ -93,6 +98,12 @@ def check_new_vendor(base: str, files: list[str], errors: list[str]) -> None:
             check=False,
         )
         if exists.returncode != 0:
+            approved_tree = APPROVED_NEW_VENDOR_TREES.get(root)
+            if approved_tree is not None:
+                actual_tree = git("rev-parse", f"{head}:{root}", text=True)
+                assert isinstance(actual_tree, str)
+                if actual_tree.strip() == approved_tree:
+                    continue
             errors.append(f"new vendored dependency requires explicit maintainer handling: {root}")
 
 
@@ -207,7 +218,7 @@ def main() -> None:
     warnings: list[str] = []
     check_artifacts(files, errors, warnings)
     check_control_symlinks(files, errors)
-    check_new_vendor(args.base, files, errors)
+    check_new_vendor(args.base, args.head, files, errors)
     check_workflows(args.base, args.head, files, errors, warnings)
     check_scope(args.base, args.head, files, warnings)
 
