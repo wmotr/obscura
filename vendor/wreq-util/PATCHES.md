@@ -5,7 +5,8 @@ Archive SHA-256: `baa5d2ab72139256916ca352a3d05c53d74e1dd360052eb5ba7691033c417c
 
 The only functional change to the published crate is the normalized
 `Cargo.toml` requirement for `zstd`, upgraded from `0.13.3` to `0.14.3`.
-`Cargo.toml.orig` preserves the original upstream manifest.
+`Cargo.toml.orig` preserves the original upstream manifest. Registry bookkeeping
+files and upstream-only `.github` automation are omitted.
 
 This resolves RUSTSEC-2026-0391 and allows the patched `zstd-safe` and
 `zstd-sys` releases required by RUSTSEC-2026-0398, RUSTSEC-2026-0403 and
