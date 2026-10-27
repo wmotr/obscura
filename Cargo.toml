@@ -66,6 +66,8 @@ taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and
 # rasterization until the upstream API exposes them.
 cosmic-text = { path = "vendor/cosmic-text" }
+# Preserve the pinned emulation API while upgrading its vulnerable zstd dependency.
+wreq-util = { path = "vendor/wreq-util" }
 
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return
