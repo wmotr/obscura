@@ -12,7 +12,7 @@ class VendorApprovalTests(unittest.TestCase):
     BASE = "1" * 40
     HEAD = "2" * 40
     ROOT = "vendor/wreq-util"
-    TREE = "30aad1fc36154d6013974f822b9e74de48012a85"
+    TREE = "24d4d93e01c9227d83a5009e32bdba42aab276f2"
 
     def check_vendor(self, root, tree=None, exists=False):
         errors = []

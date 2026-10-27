@@ -36,7 +36,7 @@ BLOCKED_SUFFIXES = {".dll", ".dylib", ".exe", ".o", ".obj", ".pyc", ".so"}
 # Trusted-base approval covers only this reviewed security patch, not an
 # arbitrary new crate or later changes to the incoming dependency tree.
 APPROVED_NEW_VENDOR_TREES = {
-    "vendor/wreq-util": "30aad1fc36154d6013974f822b9e74de48012a85",
+    "vendor/wreq-util": "24d4d93e01c9227d83a5009e32bdba42aab276f2",
 }
 
 
