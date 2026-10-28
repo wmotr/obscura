@@ -52,15 +52,165 @@ const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
 use crate::types::CdpRequest;
 
-struct CdpMessage {
+/// Inbound commands queued for one processor. Bounded in both modes: the
+/// per-connection queue backpressures that connection's reader, and the shared
+/// queue backpressures every attached client, so neither can grow without bound.
+const MAX_PENDING_COMMANDS: usize = 1024;
+const MAX_SHARED_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SHARED_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+fn queue_shared_message(
+    tx: &mpsc::Sender<String>,
+    overflowed: &AtomicBool,
+    queued_bytes: &AtomicUsize,
     text: String,
-    reply_tx: mpsc::UnboundedSender<String>,
+) -> Result<(), ()> {
+    let len = text.len();
+    if len > MAX_SHARED_MESSAGE_BYTES || queued_bytes.fetch_update(
+        Ordering::AcqRel, Ordering::Acquire,
+        |bytes| bytes.checked_add(len).filter(|total| *total <= MAX_SHARED_QUEUED_BYTES),
+    ).is_err() {
+        overflowed.store(true, Ordering::Release);
+        return Err(());
+    }
+    if tx.try_send(text).is_err() {
+        queued_bytes.fetch_sub(len, Ordering::AcqRel);
+        overflowed.store(true, Ordering::Release);
+        return Err(());
+    }
+    Ok(())
 }
 
-enum ServerMessage {
+/// Where a command's response goes.
+///
+/// `Single` is the default one-socket server. `Shared` is a client of the
+/// opt-in shared session: the message is queued for that client only, and a full
+/// queue marks the client so the processor disconnects it instead of blocking.
+#[derive(Clone)]
+pub(crate) enum ReplyTx {
+    Single(mpsc::UnboundedSender<String>),
+    Shared {
+        tx: mpsc::Sender<String>,
+        overflowed: Arc<AtomicBool>,
+        queued_bytes: Arc<AtomicUsize>,
+    },
+}
+
+impl ReplyTx {
+    pub(crate) fn single(tx: mpsc::UnboundedSender<String>) -> Self {
+        ReplyTx::Single(tx)
+    }
+
+    pub(crate) fn shared(tx: mpsc::Sender<String>, overflowed: Arc<AtomicBool>, queued_bytes: Arc<AtomicUsize>) -> Self {
+        ReplyTx::Shared { tx, overflowed, queued_bytes }
+    }
+
+    pub(crate) fn send(&self, text: String) -> Result<(), ()> {
+        match self {
+            ReplyTx::Single(tx) => tx.send(text).map_err(|_| ()),
+            ReplyTx::Shared { tx, overflowed, queued_bytes } =>
+                queue_shared_message(tx, overflowed, queued_bytes, text),
+        }
+    }
+}
+
+/// A WebSocket attached to the shared session.
+///
+/// Kept by the processor so events can be broadcast and so a client whose
+/// outbound queue filled up can be evicted. `close` wakes the connection task,
+/// which is the only place the socket is written.
+pub(crate) struct SharedClient {
+    pub(crate) id: u64,
+    pub(crate) tx: mpsc::Sender<String>,
+    pub(crate) close: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) overflowed: Arc<AtomicBool>,
+    pub(crate) queued_bytes: Arc<AtomicUsize>,
+}
+
+impl SharedClient {
+    fn try_send(&self, text: &str) {
+        let _ = queue_shared_message(&self.tx, &self.overflowed, &self.queued_bytes, text.to_string());
+    }
+}
+
+/// Event fan-out for one processor iteration.
+///
+/// Events are broadcast to every client of a shared session and go to the single
+/// socket in the default mode. Responses never travel through here: they are
+/// addressed to the `ReplyTx` of the client that sent the command, so two clients
+/// can use the same command id without stealing each other's answer.
+struct Routing<'a> {
+    single: Option<ReplyTx>,
+    shared: &'a mut Vec<SharedClient>,
+}
+
+impl Routing<'_> {
+    fn event(&mut self, text: String) {
+        if !self.shared.is_empty() {
+            for client in self.shared.iter() {
+                client.try_send(&text);
+            }
+            evict_slow_shared_clients(self.shared);
+        } else if let Some(tx) = self.single.as_ref() {
+            let _ = tx.send(text);
+        }
+    }
+}
+
+/// Drop any shared client whose outbound queue overflowed. One slow reader must
+/// not pin the session's memory or stall the other clients' events; the
+/// connection task is woken so it can send a WebSocket close frame.
+fn evict_slow_shared_clients(clients: &mut Vec<SharedClient>) {
+    let mut index = 0;
+    while index < clients.len() {
+        if clients[index].overflowed.load(Ordering::Acquire) {
+            warn!(
+                "shared session: disconnecting client {} (outbound queue full)",
+                clients[index].id
+            );
+            let mut client = clients.remove(index);
+            if let Some(close) = client.close.take() {
+                let _ = close.send(());
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn attach_shared_client(clients: &mut Vec<SharedClient>, client: SharedClient) {
+    if clients.iter().any(|existing| existing.id == client.id) {
+        return;
+    }
+    // Same handshake marker the default path sends, so a client that waits for
+    // it keeps working; the connection task does not forward it to the socket.
+    client.try_send(&json!({"__init": true}).to_string());
+    clients.push(client);
+}
+
+fn detach_shared_client(clients: &mut Vec<SharedClient>, client_id: u64) {
+    if let Some(index) = clients.iter().position(|client| client.id == client_id) {
+        clients.remove(index);
+    }
+}
+
+pub(crate) struct CdpMessage {
+    pub(crate) text: String,
+    pub(crate) reply_tx: ReplyTx,
+}
+
+pub(crate) enum ServerMessage {
     Cdp(CdpMessage),
     NewConnection {
-        reply_tx: mpsc::UnboundedSender<String>,
+        reply_tx: ReplyTx,
+    },
+    /// An authenticated WebSocket joined the shared session.
+    SharedAttach {
+        client: SharedClient,
+    },
+    /// A shared-session client went away; its pages and sessions stay.
+    SharedDetach {
+        client_id: u64,
     },
 }
 
@@ -550,7 +700,11 @@ fn run_connection(
                         return;
                     }
                 };
-                let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                // Bounded so a client that stops reading applies backpressure
+                // instead of growing the queue without limit. Sized well above
+                // MAX_DEFERRED_MESSAGES so a navigation still has room for the
+                // commands that arrive after it.
+                let (msg_tx, msg_rx) = mpsc::channel::<ServerMessage>(MAX_PENDING_COMMANDS);
                 let processor = tokio::task::spawn_local(cdp_processor(
                     msg_rx,
                     default_context,
@@ -822,11 +976,30 @@ fn handle_http_json_blocking(
 /// own isolated `BrowserContext` (cookie jar and HTTP client). Cookie deltas are
 /// merged into the persistence template when the connection thread exits.
 async fn cdp_processor(
-    mut rx: mpsc::UnboundedReceiver<ServerMessage>,
+    rx: mpsc::Receiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
 ) {
-    let mut ctx = CdpContext::new_with_shared_context(default_context);
+    cdp_processor_with_ctx(
+        rx,
+        CdpContext::new_with_shared_context(default_context),
+        shutdown_notify,
+    )
+    .await
+}
+
+/// The processor behind one session: one `CdpContext`, one LocalSet, one owner
+/// for every isolate it creates.
+///
+/// The opt-in shared session runs exactly this, with a `CdpContext` that several
+/// authenticated clients multiplex into, instead of sharing a context across
+/// threads. Nothing below assumes a single socket: responses go to the `ReplyTx`
+/// that carried the command, events go through `Routing`.
+pub(crate) async fn cdp_processor_with_ctx(
+    mut rx: mpsc::Receiver<ServerMessage>,
+    mut ctx: CdpContext,
+    shutdown_notify: Arc<Notify>,
+) {
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
@@ -851,7 +1024,11 @@ async fn cdp_processor(
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
     let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
     screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
+    let mut connection_reply_tx: Option<ReplyTx> = None;
+    // The default mode has at most one socket; a shared session keeps the list
+    // of every attached client so events can be broadcast and slow readers
+    // evicted without disturbing the rest.
+    let mut shared_clients: Vec<SharedClient> = Vec::new();
     // A real browser renderer continues servicing timers, networking, posted
     // tasks, and animation callbacks while its DevTools client is silent. Keep
     // one wake-driven deno_core turn armed after work may have been scheduled;
@@ -908,11 +1085,14 @@ async fn cdp_processor(
                     sync_live_page_network_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
-                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
-                    if let (Some(reply_tx), Some((session_id, url, method, body))) = (
-                        connection_reply_tx.as_ref(),
-                        take_live_pending_navigation(&ctx),
-                    ) {
+                    let mut routing = Routing {
+                        single: connection_reply_tx.clone(),
+                        shared: &mut shared_clients,
+                    };
+                    forward_pending_events(&mut ctx, &mut routing).await;
+                    if let Some((session_id, url, method, body)) =
+                        take_live_pending_navigation(&ctx)
+                    {
                         let navigation = json!({
                             "id": 0,
                             "method": "Page.navigate",
@@ -923,7 +1103,8 @@ async fn cdp_processor(
                         process_with_interception(
                             &navigation,
                             &mut ctx,
-                            reply_tx,
+                            None,
+                            &mut routing,
                             &mut rx,
                             &mut intercept_rx,
                             &mut intercepted_paused,
@@ -942,14 +1123,16 @@ async fn cdp_processor(
                         std::future::pending().await
                     }
                 }, if has_intercept_rx => {
-                    if let (Some((session_id, frame_id)), Some(reply_tx)) =
-                        (live_page_route.as_ref(), connection_reply_tx.as_ref())
-                    {
+                    if let Some((session_id, frame_id)) = live_page_route.as_ref() {
+                        let mut routing = Routing {
+                            single: connection_reply_tx.clone(),
+                            shared: &mut shared_clients,
+                        };
                         emit_intercepted_request(
                             intercepted,
                             frame_id,
                             Some(session_id.clone()),
-                            reply_tx,
+                            &mut routing,
                             &mut intercepted_paused,
                         );
                     } else {
@@ -962,10 +1145,11 @@ async fn cdp_processor(
                     None
                 },
                 _ = screencast_tick.tick(), if screencast_active => {
-                    pump_and_forward_screencast_frames(
-                        &mut ctx,
-                        connection_reply_tx.as_ref(),
-                    ).await;
+                    let mut routing = Routing {
+                        single: connection_reply_tx.clone(),
+                        shared: &mut shared_clients,
+                    };
+                    pump_and_forward_screencast_frames(&mut ctx, &mut routing).await;
                     None
                 }
             }
@@ -978,12 +1162,24 @@ async fn cdp_processor(
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
-                let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
-                );
+                let _ = reply_tx.send(json!({"__init": true}).to_string());
+            }
+            ServerMessage::SharedAttach { client } => {
+                // The page, its sessions and the cookie jar all live in `ctx`, so
+                // a client that reconnects (or a second client of the same task)
+                // joins the document that is already there.
+                attach_shared_client(&mut shared_clients, client);
+            }
+            ServerMessage::SharedDetach { client_id } => {
+                // Only the socket goes away: the page stays, so a reconnect
+                // picks the same DOM back up.
+                detach_shared_client(&mut shared_clients, client_id);
             }
             ServerMessage::Cdp(cdp_msg) => {
+                let mut routing = Routing {
+                    single: connection_reply_tx.clone(),
+                    shared: &mut shared_clients,
+                };
                 // Route every Page.navigate through the spawn-and-defer path,
                 // not just intercepted ones. Holding the V8 lock across a
                 // multi-second navigate inside the regular dispatch wedges the
@@ -996,9 +1192,15 @@ async fn cdp_processor(
 
                 if is_navigation {
                     process_with_interception(
-                        &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused,
-                        &mut deferred, true,
+                        &cdp_msg.text,
+                        &mut ctx,
+                        Some(&cdp_msg.reply_tx),
+                        &mut routing,
+                        &mut rx,
+                        &mut intercept_rx,
+                        &mut intercepted_paused,
+                        &mut deferred,
+                        true,
                     ).await;
                 } else {
                     let fetch_was_resolved = cdp_msg.text.contains("Fetch.")
@@ -1009,11 +1211,19 @@ async fn cdp_processor(
                             &mut intercepted_paused,
                         );
                     if !fetch_was_resolved {
-                        process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
+                        process_cdp_message(
+                            &cdp_msg.text,
+                            &mut ctx,
+                            Some(&cdp_msg.reply_tx),
+                            &mut routing,
+                        )
+                        .await;
                     }
                 }
             }
         }
+
+        evict_slow_shared_clients(&mut shared_clients);
 
         // Dispatch may have created a page or scheduled new asynchronous work.
         // A single live isolate is the connection's current active target; the
@@ -1032,7 +1242,7 @@ fn emit_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     frame_id: &str,
     session_id: Option<String>,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    routing: &mut Routing<'_>,
     intercepted_paused: &mut HashMap<
         String,
         tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>,
@@ -1069,7 +1279,7 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    let _ = reply_tx.send(request_will_be_sent.to_string());
+    routing.event(request_will_be_sent.to_string());
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -1085,7 +1295,7 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    let _ = reply_tx.send(request_paused.to_string());
+    routing.event(request_paused.to_string());
     intercepted_paused.insert(intercepted.request_id, intercepted.resolver);
 }
 
@@ -1143,16 +1353,17 @@ fn take_live_pending_navigation(
     Some((session_id, url, method, body))
 }
 
-fn forward_pending_events(
-    ctx: &mut CdpContext,
-    reply_tx: Option<&mpsc::UnboundedSender<String>>,
-) {
-    let Some(reply_tx) = reply_tx else {
-        return;
-    };
+async fn forward_pending_events(ctx: &mut CdpContext, routing: &mut Routing<'_>) {
+    let shared = !routing.shared.is_empty();
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
+            routing.event(json);
+            // Producer and socket writers share this LocalSet. Give healthy
+            // readers a turn so a synchronous event burst is not mistaken for
+            // a slow client merely because it exceeds the queue capacity.
+            if shared {
+                tokio::task::yield_now().await;
+            }
         }
     }
 }
@@ -1169,16 +1380,13 @@ fn has_active_screencast(ctx: &CdpContext) -> bool {
     }
 }
 
-async fn pump_and_forward_screencast_frames(
-    ctx: &mut CdpContext,
-    reply_tx: Option<&mpsc::UnboundedSender<String>>,
-) {
+async fn pump_and_forward_screencast_frames(ctx: &mut CdpContext, routing: &mut Routing<'_>) {
     #[cfg(feature = "render")]
     crate::domains::page::pump_screencast_frames(ctx).await;
     #[cfg(not(feature = "render"))]
     let _ = ctx;
 
-    forward_pending_events(ctx, reply_tx);
+    forward_pending_events(ctx, routing).await;
 }
 
 // Whether a raw CDP frame is exactly a `Page.navigate` call, and so should take
@@ -1214,7 +1422,7 @@ fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<String, Strin
 fn handle_fetch_resolution(
     text: &str,
     _ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: &ReplyTx,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
 ) -> bool {
     if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
@@ -1267,8 +1475,9 @@ fn handle_fetch_resolution(
 async fn process_with_interception(
     text: &str,
     ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
-    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    reply_tx: Option<&ReplyTx>,
+    routing: &mut Routing<'_>,
+    rx: &mut mpsc::Receiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
     deferred: &mut std::collections::VecDeque<ServerMessage>,
@@ -1277,7 +1486,7 @@ async fn process_with_interception(
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}", e);
+            warn!("Invalid CDP JSON at line {}, column {}", e.line(), e.column());
             return;
         }
     };
@@ -1293,7 +1502,7 @@ async fn process_with_interception(
     let page_id = match page_id {
         Some(id) => id,
         None => {
-            process_cdp_message(text, ctx, reply_tx).await;
+            process_cdp_message(text, ctx, reply_tx, routing).await;
             return;
         }
     };
@@ -1302,7 +1511,7 @@ async fn process_with_interception(
     let mut page = match page_index {
         Some(idx) => ctx.pages.remove(idx),
         None => {
-            process_cdp_message(text, ctx, reply_tx).await;
+            process_cdp_message(text, ctx, reply_tx, routing).await;
             return;
         }
     };
@@ -1405,7 +1614,7 @@ async fn process_with_interception(
                     intercepted,
                     &frame_id,
                     session_for_events.clone(),
-                    reply_tx,
+                    routing,
                     intercepted_paused,
                 );
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1419,6 +1628,14 @@ async fn process_with_interception(
                         let sid = format!("{}-session", pid);
                         ctx.sessions.insert(sid.clone(), pid.clone());
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
+                    }
+                    // A shared-session client can attach mid-navigation: only the
+                    // routing table changes, no page or isolate is touched here.
+                    ServerMessage::SharedAttach { client } => {
+                        attach_shared_client(routing.shared, client);
+                    }
+                    ServerMessage::SharedDetach { client_id } => {
+                        detach_shared_client(routing.shared, client_id);
                     }
                     ServerMessage::Cdp(msg) => {
                         if msg.text.contains("Fetch.continueRequest")
@@ -1489,7 +1706,7 @@ async fn process_with_interception(
     };
 
     if send_command_response {
-        if let Ok(json) = serde_json::to_string(&response) {
+        if let (Some(reply_tx), Ok(json)) = (reply_tx, serde_json::to_string(&response)) {
             let _ = reply_tx.send(json);
         }
     }
@@ -1518,27 +1735,27 @@ async fn process_with_interception(
             tracing::warn!("could not produce post-navigation screencast frame: {error}");
         }
     }
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
-        }
-    }
+    forward_pending_events(ctx, routing).await;
 }
 
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
+    reply_tx: Option<&ReplyTx>,
+    routing: &mut Routing<'_>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}: {}", e, crate::util::truncate_on_char_boundary(text, 200));
+            // Never echo the frame itself: a malformed message can carry page
+            // content, an eval expression, or a credential, and `RUST_LOG` may
+            // be `trace`. Serde's error text can also echo invalid field values.
+            warn!("Invalid CDP JSON at line {}, column {}", e.line(), e.column());
             return;
         }
     };
 
-    tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
+    tracing::debug!("CDP request id={}", req.id);
 
     let response = dispatch::dispatch(&req, ctx).await;
 
@@ -1548,13 +1765,9 @@ async fn process_cdp_message(
     // Playwright awaits the response and immediately reads state wired up
     // by those events; if the response lands first, accessing
     // Target._page errors with "Cannot read properties of undefined".
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
-        }
-    }
+    forward_pending_events(ctx, routing).await;
 
-    if let Ok(json) = serde_json::to_string(&response) {
+    if let (Some(reply_tx), Ok(json)) = (reply_tx, serde_json::to_string(&response)) {
         let _ = reply_tx.send(json);
     }
 
@@ -1567,11 +1780,7 @@ async fn process_cdp_message(
             session_id: req.session_id.clone(),
         };
         let _ = dispatch::dispatch(&nav_req, ctx).await;
-        for event in ctx.pending_events.drain(..) {
-            if let Ok(json) = serde_json::to_string(&event) {
-                let _ = reply_tx.send(json);
-            }
-        }
+        forward_pending_events(ctx, routing).await;
     }
 }
 
@@ -1602,7 +1811,7 @@ fn decode_base64(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn fast_path_response(text: &str) -> Option<String> {
+pub(crate) fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     let result = match req.method.as_str() {
@@ -1650,7 +1859,7 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
 
 async fn handle_connection_ws(
     stream: TcpStream,
-    msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    msg_tx: mpsc::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -1667,9 +1876,11 @@ async fn handle_connection_ws(
 
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
 
-    let _ = msg_tx.send(ServerMessage::NewConnection {
-        reply_tx: reply_tx.clone(),
-    });
+    let _ = msg_tx
+        .send(ServerMessage::NewConnection {
+            reply_tx: ReplyTx::single(reply_tx.clone()),
+        })
+        .await;
     if let Some(init_msg) = reply_rx.recv().await {
         tracing::debug!("Connection init: {}", &init_msg[..init_msg.len().min(100)]);
     }
@@ -1709,10 +1920,12 @@ async fn handle_connection_ws(
                 if let Some(resp) = fast_path_response(&text) {
                     let _ = reply_tx.send(resp);
                 } else {
-                    let _ = msg_tx.send(ServerMessage::Cdp(CdpMessage {
-                        text: text.to_string(),
-                        reply_tx: reply_tx.clone(),
-                    }));
+                    let _ = msg_tx
+                        .send(ServerMessage::Cdp(CdpMessage {
+                            text: text.to_string(),
+                            reply_tx: ReplyTx::single(reply_tx.clone()),
+                        }))
+                        .await;
                 }
             }
             Message::Close(_) => {
@@ -1733,10 +1946,30 @@ mod tests {
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
     };
     #[cfg(feature = "render")]
-    use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
+    use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop, ReplyTx, Routing};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn shared_queue_byte_budget_disconnects_only_the_overflowing_client() {
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let reply = super::ReplyTx::shared(tx.clone(), overflowed.clone(), bytes.clone());
+        assert!(reply.send("x".repeat(super::MAX_SHARED_MESSAGE_BYTES)).is_ok());
+        assert!(reply.send("x".repeat(super::MAX_SHARED_MESSAGE_BYTES)).is_ok());
+        assert!(reply.send("x".into()).is_err());
+        assert_eq!(bytes.load(Ordering::Acquire), super::MAX_SHARED_QUEUED_BYTES);
+        let (close, mut closed) = tokio::sync::oneshot::channel();
+        let mut clients = vec![super::SharedClient {
+            id: 1, tx, close: Some(close), overflowed, queued_bytes: bytes,
+        }];
+        super::evict_slow_shared_clients(&mut clients);
+        assert!(clients.is_empty());
+        assert!(closed.try_recv().is_ok());
+    }
 
     fn cookie(name: &str, value: &str) -> CookieInfo {
         CookieInfo {
@@ -1755,7 +1988,7 @@ mod tests {
     async fn page_runtime_advances_while_cdp_client_is_silent() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (server_tx, server_rx) = tokio::sync::mpsc::channel(super::MAX_PENDING_COMMANDS);
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
                 let default_context = crate::dispatch::CdpContext::new().default_context;
@@ -1767,19 +2000,19 @@ mod tests {
 
                 server_tx
                     .send(super::ServerMessage::NewConnection {
-                        reply_tx: reply_tx.clone(),
+                        reply_tx: super::ReplyTx::single(reply_tx.clone()),
                     })
+                    .await
                     .unwrap();
                 let init = reply_rx.recv().await.expect("processor init");
                 assert!(init.contains("__init"));
 
                 let send = |value: serde_json::Value| {
-                    server_tx
-                        .send(super::ServerMessage::Cdp(super::CdpMessage {
-                            text: value.to_string(),
-                            reply_tx: reply_tx.clone(),
-                        }))
-                        .unwrap();
+                    let message = super::ServerMessage::Cdp(super::CdpMessage {
+                        text: value.to_string(),
+                        reply_tx: super::ReplyTx::single(reply_tx.clone()),
+                    });
+                    server_tx.try_send(message).expect("processor queue");
                 };
                 send(json!({
                     "id": 1,
@@ -1944,12 +2177,13 @@ mod tests {
         let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
         let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let reply = super::ReplyTx::single(reply_tx);
         let mut ctx = crate::dispatch::CdpContext::new();
 
         assert!(handle_fetch_resolution(
             r#"{"id":17,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
             &mut ctx,
-            &reply_tx,
+            &reply,
             &mut paused,
         ));
         assert!(matches!(
@@ -2002,13 +2236,18 @@ mod tests {
         ctx.pending_events.clear();
 
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut clients = Vec::new();
+        let mut routing = Routing {
+            single: Some(ReplyTx::single(reply_tx)),
+            shared: &mut clients,
+        };
         ctx.get_session_page_mut(&session)
             .expect("page")
             .evaluate(
                 "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:green'), 0)",
             );
         pump_live_page_event_loop(&mut ctx).await.unwrap();
-        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        pump_and_forward_screencast_frames(&mut ctx, &mut routing).await;
         let first_update: serde_json::Value = serde_json::from_str(
             &reply_rx.try_recv().expect("timer mutation should emit a frame"),
         )
@@ -2027,7 +2266,7 @@ mod tests {
                 "setTimeout(() => document.body.setAttribute('style', 'margin:0;width:96px;height:64px;background:blue'), 0)",
             );
         pump_live_page_event_loop(&mut ctx).await.unwrap();
-        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        pump_and_forward_screencast_frames(&mut ctx, &mut routing).await;
         assert!(reply_rx.try_recv().is_err());
         assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
 
@@ -2039,7 +2278,7 @@ mod tests {
         )
         .await
         .expect("ack current frame");
-        pump_and_forward_screencast_frames(&mut ctx, Some(&reply_tx)).await;
+        pump_and_forward_screencast_frames(&mut ctx, &mut routing).await;
         let after_ack: serde_json::Value = serde_json::from_str(
             &reply_rx
                 .try_recv()
@@ -2109,14 +2348,17 @@ mod tests {
             );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         pump_live_page_event_loop(&mut ctx).await.unwrap();
-        pump_and_forward_screencast_frames(&mut ctx, None).await;
-        let raf_frame = ctx
-            .pending_events
-            .iter()
-            .find(|event| event.method == "Page.screencastFrame")
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut clients = Vec::new();
+        let mut routing = Routing { single: Some(ReplyTx::Single(reply_tx)), shared: &mut clients };
+        pump_and_forward_screencast_frames(&mut ctx, &mut routing).await;
+        let events: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+            .map(|text| serde_json::from_str(&text).unwrap()).collect();
+        let raf_frame = events.iter()
+            .find(|event| event["method"] == "Page.screencastFrame")
             .expect("RAF visual mutation must autonomously emit a frame");
         assert_ne!(
-            raf_frame.params["data"].as_str().unwrap(),
+            raf_frame["params"]["data"].as_str().unwrap(),
             initial_data,
             "RAF-driven paint must capture the updated visible state"
         );
