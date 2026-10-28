@@ -83,7 +83,8 @@ const MESSAGING_CHILD_HTML: &str = r#"<!doctype html><html><body>
 
 /// Minimal HTTP/1.1 server serving the parent document at `/` and the child at
 /// `/child.html`.
-fn spawn_server(parent_html: &'static str) -> String {
+fn spawn_server(parent_html: &str) -> String {
+    let parent_html = parent_html.to_owned();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -94,12 +95,17 @@ fn spawn_server(parent_html: &'static str) -> String {
             };
             let mut buf = [0u8; 2048];
             let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]);
+            if let Some(target) = request.split_whitespace().nth(1).and_then(|path| path.strip_prefix("/redirect?")) {
+                let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
+            }
             let body = if buf[..read].starts_with(b"GET /child.html ") {
                 CHILD_HTML
             } else if buf[..read].starts_with(b"GET /child-messaging.html ") {
                 MESSAGING_CHILD_HTML
             } else {
-                parent_html
+                parent_html.as_str()
             };
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -111,6 +117,75 @@ fn spawn_server(parent_html: &'static str) -> String {
         }
     });
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn no_cors_filters_script_fetches_but_not_frame_navigation() {
+    check_no_cors_frame_navigation(false).await;
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test]
+async fn stealth_no_cors_filters_script_fetches_but_not_frame_navigation() {
+    check_no_cors_frame_navigation(true).await;
+}
+
+async fn check_no_cors_frame_navigation(stealth: bool) {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let child_base = spawn_server(CHILD_HTML);
+    let child_url = format!("{child_base}/child.html");
+    let parent_html = format!(r#"<!doctype html><title>parent</title><body>
+        <iframe src="/redirect?{child_url}"></iframe>
+        <script>
+        window.__fetchResult = null;
+        (async () => {{
+            const same = await fetch('/child.html', {{mode: 'no-cors'}});
+            const sameText = await same.text();
+            // Extra arguments/options must not bypass public response filtering.
+            const cross = await fetch('{child_url}', {{mode: 'no-cors', frameNavigation: true}}, true);
+            const redirected = await fetch('/redirect?{child_url}', {{mode: 'no-cors'}});
+            const roundtrip = await fetch('/redirect?{child_base}/redirect?' + location.origin + '/child.html', {{mode: 'no-cors'}});
+            const filtered = async response => response.type === 'opaque' && response.status === 0 &&
+                !response.ok && response.url === '' && response.body === null &&
+                Array.from(response.headers).length === 0 && await response.text() === '';
+            window.__fetchResult = {{
+                sameType: same.type,
+                sameReadable: sameText.includes('RAN-IN-CHILD'),
+                crossType: cross.type,
+                crossNullBody: cross.body === null,
+                crossText: await cross.text(),
+                crossFiltered: await filtered(cross),
+                redirectFiltered: await filtered(redirected),
+                roundtripFiltered: await filtered(roundtrip),
+                bypassHelper: typeof globalThis._fetchResponse
+            }};
+        }})().catch(error => {{ window.__fetchResult = String(error); }});
+        </script>"#);
+    let parent_base = spawn_server(&parent_html);
+    let browser = Browser::builder().stealth(stealth).build().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&parent_base).await.unwrap();
+    page.settle(2000).await;
+
+    assert_eq!(page.evaluate("window.__fetchResult"), serde_json::json!({
+        "sameType": "basic",
+        "sameReadable": true,
+        "crossType": "opaque",
+        "crossNullBody": true,
+        "crossText": "",
+        "crossFiltered": true,
+        "redirectFiltered": true,
+        "roundtripFiltered": true,
+        "bypassHelper": "undefined"
+    }));
+    assert_eq!(page.frame_urls(), vec![child_url.clone()]);
+    assert_eq!(page.evaluate("document.querySelector('iframe').contentDocument === null"), serde_json::json!(true));
+    assert_eq!(page.evaluate_in_frame(0, "document.URL").unwrap(), serde_json::json!(child_url));
+    assert_eq!(
+        page.evaluate_in_frame(0, "document.title").unwrap(),
+        serde_json::json!("RAN-IN-CHILD"),
+        "opaque filtering must not discard a cross-origin frame document"
+    );
 }
 
 #[tokio::test]

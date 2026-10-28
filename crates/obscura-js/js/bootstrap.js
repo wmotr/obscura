@@ -4070,29 +4070,33 @@ class Element extends Node {
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
-    if (!url.includes('://')) {
-      try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
-    }
+    try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch {}
     // Both the src setter and the parser sweep in __obscura_init reach here, so
     // a frame the page assigned before init must not be fetched a second time.
     if (this._iframeLoadingUrl === fullUrl) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
     const el = this;
-    fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
+    // Document navigation consumes host bytes, not a script-visible opaque Response.
+    const pageOrigin = (function() { try { return new URL(_domParse("document_url")).origin; } catch { return ""; } })();
+    Deno.core.ops.op_fetch_url(fullUrl, 'GET', '{}', '', pageOrigin, 'no-cors', 'same-origin').then(raw => {
       if (el._iframeLoadingUrl !== fullUrl) return;
-      if (resp.ok || resp.type === 'opaque') {
-        const html = await resp.text();
+      const resp = JSON.parse(raw);
+      if (resp.blocked || resp.corsBlocked) throw new TypeError('Failed to load iframe');
+      const documentUrl = resp.url || fullUrl;
+      if (resp.status !== 0) {
+        const bytes = resp.bodyBase64 ? _base64ToUint8Array(resp.bodyBase64) : _bodyToUint8Array(resp.body || '');
+        const html = _decodeBodyWithCharset(bytes, new Headers(resp.headers || {}));
         // Hand the document to the host, which gives this frame a realm of its
         // own and runs the scripts that came with it (issue #600). The shim
         // document below stays: it is what the parent reads through
         // contentDocument.
         const box = el.getBoundingClientRect();
         el._frameId = Deno.core.ops.op_frame_document_ready(
-          fullUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+          documentUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
-        el._iframeDoc = new _IframeDocument(html, fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeDoc = new _IframeDocument(html, documentUrl, el);
+        el._iframeWin = new _IframeWindow(el._iframeDoc, documentUrl);
         // Bind the window to the realm the host just queued. This is what makes
         // posting into the frame reach the frame's own listeners, and makes a
         // message coming back out arrive with this window as its `source`.
@@ -4102,8 +4106,8 @@ class Element extends Node {
           globalThis.__obscura_frameElements[el._frameId] = el;
         }
       } else {
-        el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', documentUrl, el);
+        el._iframeWin = new _IframeWindow(el._iframeDoc, documentUrl);
       }
 
       // Dispatch through the element so the onload property/attribute and any
@@ -4124,8 +4128,9 @@ class Element extends Node {
     if (real?.document) return real.document;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
-      const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
-      if (pageOrigin === iframeOrigin || this.src === '' || this.src === 'about:blank' || !this.src.includes('://')) {
+      const frameUrl = this._iframeDoc.URL || this.src;
+      const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch { return ''; } })(frameUrl);
+      if (pageOrigin === iframeOrigin || frameUrl === '' || frameUrl === 'about:blank' || !frameUrl.includes('://')) {
         return this._iframeDoc;
       }
       return null; // Cross-origin: blocked
@@ -6937,15 +6942,18 @@ globalThis.fetch = async (input, init = {}) => {
   if (parsed.corsBlocked) {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
-  const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
+  const responseOrigin = (function() { try { return new URL(parsed.url || url).origin; } catch { return ""; } })();
+  const opaque = parsed.status === 0 || parsed.opaque || (fetchMode === "no-cors" && responseOrigin !== pageOrigin);
+  const respType = opaque ? "opaque" : "basic";
+  const nullBody = method.toUpperCase() === 'HEAD' || [101, 103, 204, 205, 304].includes(parsed.status) || respType === 'opaque';
+  const responseBody = nullBody ? null : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
   const response = new Response(responseBody, {
-    status: parsed.status,
+    status: opaque ? 0 : parsed.status,
     statusText: "",
-    headers: parsed.headers || {},
+    headers: opaque ? {} : (parsed.headers || {}),
     type: respType,
-    url: parsed.url || url,
-    redirected: false,
+    url: opaque ? "" : (parsed.url || url),
+    redirected: !opaque && !!parsed.redirected,
   });
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
@@ -7375,16 +7383,69 @@ function _decodeBodyWithCharset(bytes, headers) {
 if (typeof Response === 'undefined') {
   globalThis.Response = class Response {
     constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status || 200; this.statusText = init.statusText || '';
+      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status === undefined ? 200 : init.status; this.statusText = init.statusText || '';
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
       this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      // Backport upstream #818: ofetch requires a body stream before decoding.
+      this._bodyNull = body === null || body === undefined;
+      this._bodyStream = null;
+      this._bodyUsed = false;
     }
-    async text() { return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
+    _consumeBody() {
+      if (this._bodyUsed || this._bodyStream?.locked) throw new TypeError('Body is already consumed or locked');
+      if (!this._bodyNull) this._bodyUsed = true;
+      if (this._bodyStream) {
+        // Convenience methods consume the same buffered chunk as stream readers.
+        const reader = this._bodyStream.getReader();
+        reader.read();
+        reader.releaseLock();
+      }
+    }
+    get body() {
+      if (this._bodyNull) return null;
+      if (!this._bodyStream) {
+        this._bodyStream = new ReadableStream({
+          start: (controller) => {
+            if (!this._bodyUsed && this._bodyBytes.length) controller.enqueue(this._bodyBytes);
+            controller.close();
+          },
+          cancel: () => { this._bodyUsed = true; },
+        });
+        const response = this;
+        const stream = this._bodyStream;
+        const getReader = stream.getReader.bind(stream);
+        stream.getReader = function (...args) {
+          const reader = getReader(...args);
+          const read = reader.read.bind(reader);
+          reader.read = function (...args) {
+            response._bodyUsed = true;
+            return read(...args);
+          };
+          const cancel = reader.cancel.bind(reader);
+          reader.cancel = function (...args) {
+            response._bodyUsed = true;
+            return cancel(...args);
+          };
+          return reader;
+        };
+        const cancel = stream.cancel.bind(stream);
+        stream.cancel = function (...args) {
+          response._bodyUsed = true;
+          return cancel(...args);
+        };
+      }
+      return this._bodyStream;
+    }
+    get bodyUsed() { return this._bodyUsed; }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
     async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
+    clone() {
+      if (this._bodyUsed || this._bodyStream?.locked) throw new TypeError('Body is already consumed or locked');
+      return new Response(this._bodyNull ? null : this._bodyBytes.slice(), { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+    }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
     static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }

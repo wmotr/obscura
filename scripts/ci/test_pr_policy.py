@@ -3,7 +3,7 @@
 
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pr_policy
 
@@ -30,7 +30,7 @@ class VendorApprovalTests(unittest.TestCase):
         errors, calls = self.check_vendor(self.ROOT, self.TREE)
         self.assertEqual(errors, [])
         self.assertEqual(
-            calls, [unittest.mock.call("rev-parse", f"{self.HEAD}:{self.ROOT}", text=True)]
+            calls, [call("rev-parse", f"{self.HEAD}:{self.ROOT}", text=True)]
         )
 
     def test_modified_approved_tree_is_rejected(self):

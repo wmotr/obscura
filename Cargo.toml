@@ -52,7 +52,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio-current-thread"] }
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "trace"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
@@ -66,6 +66,8 @@ taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and
 # rasterization until the upstream API exposes them.
 cosmic-text = { path = "vendor/cosmic-text" }
+# Preserve the pinned emulation API while upgrading its vulnerable zstd dependency.
+wreq-util = { path = "vendor/wreq-util" }
 
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return

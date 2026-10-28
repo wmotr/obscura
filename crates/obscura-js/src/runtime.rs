@@ -13469,6 +13469,106 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn nuxt_style_manifest_decoder_requires_response_body() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+                const response = new Response('{"matcher":{"static":{},"wildcard":{},"dynamic":{}}}', {
+                    headers: { 'content-type': 'application/json' }
+                });
+                // ofetch skips decoding when Response.body is absent.
+                const data = response.body ? await response.json() : undefined;
+                return { matcher: !!data?.matcher, used: response.bodyUsed };
+            })()"#,
+            true,
+            true,
+        ).await.expect("manifest decoding must succeed");
+        let out = result.value.unwrap();
+        assert_eq!(out["matcher"], true);
+        assert_eq!(out["used"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_stream_consumption_and_cloning() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+                const response = new Response('hello');
+                const stream = response.body;
+                const copy = response.clone();
+                const reader = stream.getReader();
+                const initiallyUnused = !response.bodyUsed;
+                let lockedRejected = false;
+                try { await response.text(); } catch (e) { lockedRejected = e instanceof TypeError; }
+                const first = await reader.read();
+                const done = (await reader.read()).done;
+                reader.releaseLock();
+                let doubleRejected = false;
+                try { await response.text(); } catch (e) { doubleRejected = e instanceof TypeError; }
+                let cloneRejected = false;
+                try { response.clone(); } catch (e) { cloneRejected = e instanceof TypeError; }
+                const copied = await copy.text();
+                const copyDrained = (await copy.body.getReader().read()).done;
+                const cancelled = new Response('cancel');
+                await cancelled.body.cancel();
+                const empty = new Response('');
+                const nullResponse = new Response(null);
+                return {
+                    initiallyUnused, lockedRejected, doubleRejected, cloneRejected,
+                    text: new TextDecoder().decode(first.value), done, copied, copyDrained,
+                    stableStream: response.body === stream, used: response.bodyUsed,
+                    cancelled: cancelled.bodyUsed, emptyStream: empty.body !== null,
+                    nullBody: nullResponse.body === null && nullResponse.clone().body === null,
+                    nullText: await nullResponse.text(), nullUsed: nullResponse.bodyUsed,
+                };
+            })()"#,
+            true,
+            true,
+        ).await.expect("response body evaluation must succeed");
+        let out = result.value.unwrap();
+        for key in ["initiallyUnused", "lockedRejected", "doubleRejected", "cloneRejected",
+                    "done", "copyDrained", "stableStream", "used", "cancelled", "emptyStream", "nullBody"] {
+            assert_eq!(out[key], true, "{key}: {out}");
+        }
+        assert_eq!(out["text"], "hello");
+        assert_eq!(out["copied"], "hello");
+        assert_eq!(out["nullText"], "");
+        assert_eq!(out["nullUsed"], false);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_body_pipe_and_tee_mark_consumption() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate_for_cdp(
+            r#"(async () => {
+                const piped = new Response('pipe');
+                let text = '';
+                await piped.body.pipeTo(new WritableStream({
+                    write(chunk) { text += new TextDecoder().decode(chunk); }
+                }));
+                const teed = new Response('tee');
+                const branches = teed.body.tee();
+                await branches[0].getReader().read();
+                await branches[1].getReader().read();
+                const rejected = [];
+                for (const response of [piped, teed]) {
+                    let cloneRejected = false;
+                    try { response.clone(); } catch (e) { cloneRejected = e instanceof TypeError; }
+                    let textRejected = false;
+                    try { await response.text(); } catch (e) { textRejected = e instanceof TypeError; }
+                    rejected.push(response.bodyUsed && cloneRejected && textRejected);
+                }
+                return { text, rejected };
+            })()"#,
+            true,
+            true,
+        ).await.expect("stream consumption must succeed");
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "text": "pipe", "rejected": [true, true]
+        }));
+    }
+
     #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
