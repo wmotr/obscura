@@ -8,6 +8,7 @@
 * [Your first fetch](Your-first-fetch.md)
 * [Extract data](Extract-data.md)
 * [Connect Puppeteer or Playwright](Connect-Puppeteer-or-Playwright.md)
+* [Share one CDP session across clients](Shared-CDP-session.md)
 
 ## Guides
 

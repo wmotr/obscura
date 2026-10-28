@@ -3,10 +3,15 @@ pub mod dispatch;
 pub mod types;
 pub mod domains;
 pub mod cookie_params;
+pub mod shared_session;
 pub(crate) mod util;
 
 pub use server::{
     start, start_with_full_options, start_with_full_serve_options, start_with_host,
     start_with_host_and_security, start_with_options, start_with_serve_options_and_limit,
     DEFAULT_MAX_CONNECTIONS,
+};
+pub use shared_session::{
+    start_shared_session, SessionToken, SharedSessionConfig, DEFAULT_MAX_SHARED_CLIENTS,
+    MIN_SESSION_TOKEN_LEN,
 };

@@ -73,11 +73,18 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
     --allow-file-access      Permit CDP clients to navigate to file:// URLs
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --shared-session         Serve one shared session to several authorized clients
+    --session-token-file <PATH>  Token file required by --shared-session (mode 0600)
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable info logging
 ```
 
 Default endpoint is `ws://127.0.0.1:9222`.
+
+`--shared-session` keeps one page, DOM and cookie jar for every authorized
+client instead of one session per connection. It binds loopback only, refuses
+`--workers` above 1 and `--storage-dir`, and requires `--session-token-file`.
+See [Share one CDP session across clients](Shared-CDP-session.md).
 
 ## `obscura scrape [URLS]...`
 

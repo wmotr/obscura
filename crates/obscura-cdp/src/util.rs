@@ -51,6 +51,10 @@ pub(crate) fn object_id_literal(oid: &str) -> String {
 /// frames, intercepted URLs). A single frame whose byte `max` straddles a
 /// multi-byte char would otherwise panic the CDP processor task
 /// (`str::floor_char_boundary` would do this but is still unstable).
+///
+/// Test-only: the CDP server stopped echoing frame contents in its parse-error
+/// warning, so nothing in production truncates untrusted text for logs today.
+#[cfg(test)]
 pub(crate) fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;

@@ -99,6 +99,20 @@ enum Command {
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
 
+        /// Serve ONE shared session that several authenticated clients can
+        /// attach to (same page, DOM and cookies) instead of giving every
+        /// connection its own isolated context. Requires
+        /// --session-token-file, forces a loopback bind, and refuses
+        /// --workers > 1 and --storage-dir. Off by default.
+        #[arg(long)]
+        shared_session: bool,
+
+        /// File holding the shared-session bearer token (mode 600, at least 32
+        /// characters). The token is never read from argv: a command line is
+        /// visible to every local process.
+        #[arg(long, value_name = "PATH", requires = "shared_session")]
+        session_token_file: Option<std::path::PathBuf>,
+
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
         #[arg(long)]
@@ -364,6 +378,8 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             allow_file_access,
             storage_dir,
+            shared_session,
+            session_token_file,
             quiet: _,
         }) => {
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
@@ -391,6 +407,46 @@ async fn main() -> anyhow::Result<()> {
                 );
                 #[cfg(not(feature = "stealth"))]
                 tracing::info!("Stealth mode enabled (tracker blocking)");
+            }
+
+            if shared_session {
+                // One process, one session, one V8 owner. Several clients share
+                // the same page; independent sessions need independent servers.
+                if workers > 1 {
+                    anyhow::bail!(
+                        "--shared-session serves a single session in a single process: drop --workers"
+                    );
+                }
+                if let Some(dir) = storage_dir.as_ref() {
+                    anyhow::bail!(
+                        "--shared-session keeps cookies in memory and refuses --storage-dir ({}): \
+                         persisting them unencrypted would leak one task's session into another",
+                        dir.display()
+                    );
+                }
+                let Some(token_file) = session_token_file else {
+                    anyhow::bail!("--shared-session requires --session-token-file");
+                };
+                let config = obscura_cdp::SharedSessionConfig::from_token_file(
+                    port,
+                    &host,
+                    &token_file,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    allow_file_access,
+                    args.allow_private_network,
+                    obscura_cdp::DEFAULT_MAX_SHARED_CLIENTS,
+                )?;
+                // Token file path only: never the token, never the web socket URL.
+                tracing::info!(
+                    "Shared CDP session on ws://{}:{} (loopback only, token read from {})",
+                    host,
+                    port,
+                    token_file.display()
+                );
+                obscura_cdp::start_shared_session(config).await?;
+                return Ok(());
             }
 
             if workers > 1 {
